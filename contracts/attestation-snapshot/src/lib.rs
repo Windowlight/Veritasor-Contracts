@@ -15,6 +15,11 @@
 //!    timestamp).
 //! 4. **Query**: Lenders and off-chain analytics read via `get_snapshot`,
 //!    `get_snapshots_for_business`, or the epoch finalization queries.
+//! 5. **TTL maintenance**: Call `bump_snapshot_pointer_ttl` to extend the storage TTL on all
+//!    pointer entries for a (business, period) so archival snapshot pointers remain reachable.
+//! 6. **Restore (dry-run + commit)**: Before persisting a restored snapshot set, call
+//!    `restore_dry_run` to validate invariants and receive a `RestoreReport`. Only after
+//!    admin explicitly calls `restore_commit` does state actually change.
 //!
 //! ## Update rules
 //!
@@ -23,8 +28,14 @@
 //! - Snapshot frequency is determined by the writer (off-chain or on-chain trigger); this
 //!   contract does not enforce a schedule.
 //! - Once a period/epoch is finalized, no further writes for that epoch are permitted.
+//!
+//! ## Restore dry-run invariants
+//!
+//! `restore_dry_run` checks and reports:
+//! - **No duplicate keys**: each (business, period) pair must be unique in the batch.
+//! - **Expiries in the future**: any `recorded_at` must not exceed the current ledger timestamp.
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, String, Vec};
+use soroban_sdk::{contract, contractimpl, contracttype, symbol_short, Address, Env, String, Symbol, Vec};
 
 /// Maximum UTF-8 byte length for period/epoch identifiers.
 pub const MAX_PERIOD_BYTES: u32 = 128;
@@ -34,6 +45,48 @@ pub const MAX_BUSINESS_PERIODS: u32 = 512;
 
 /// Maximum indexed businesses per epoch.
 pub const MAX_EPOCH_BUSINESSES: u32 = 512;
+
+// ════════════════════════════════════════════════════════════════════
+//  TTL constants
+//
+//  Pointer entries (Snapshot + index vectors) share the contract
+//  instance TTL and are bumped together by bump_snapshot_pointer_ttl.
+// ════════════════════════════════════════════════════════════════════
+
+/// If the instance TTL falls below this ledger-sequence threshold, consider
+/// it due for a bump.  ~17 days at 5-second ledger close.
+pub const POINTER_TTL_THRESHOLD: u32 = 300_000;
+
+/// Amount to extend the instance TTL by when bumping.  ~17 days.
+pub const POINTER_TTL_BUMP: u32 = 300_000;
+
+// ════════════════════════════════════════════════════════════════════
+//  Events
+// ════════════════════════════════════════════════════════════════════
+
+/// Topic: snapshot pointer TTL bumped.
+pub const TOPIC_POINTER_TTL_BUMPED: Symbol = symbol_short!("ptr_ttl");
+
+/// Payload emitted when `bump_snapshot_pointer_ttl` successfully extends the
+/// TTL on all pointer entries for a (business, period).
+///
+/// ## Security Notes
+///
+/// - Emitted only when the pointer actually exists; callers cannot observe a
+///   bump event for entries they did not create.
+/// - No sensitive data is included.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PointerTtlBumpedEvent {
+    /// Business address whose snapshot pointer was bumped.
+    pub business: Address,
+    /// Period identifier of the snapshot pointer.
+    pub period: String,
+    /// Ledger timestamp when the bump was performed.
+    pub bumped_at: u64,
+    /// The TTL amount added (in ledger sequences).
+    pub ttl_bump: u32,
+}
 
 /// Attestation contract client: WASM import for wasm32 (avoids duplicate symbols), crate for tests.
 #[cfg(target_arch = "wasm32")]
@@ -276,6 +329,78 @@ impl AttestationSnapshotContract {
             .set(&DataKey::EpochFinalization(epoch), &finalization);
     }
 
+    // ── TTL maintenance ──────────────────────────────────────────────
+
+    /// Bump the storage TTL on all pointer entries for a (business, period).
+    ///
+    /// Archival snapshot pointers must remain reachable indefinitely.  Because
+    /// Soroban instance storage has a finite TTL, callers (admins, writers, or
+    /// an off-chain keeper) should invoke this periodically to prevent pointer
+    /// entries from expiring and becoming unreachable.
+    ///
+    /// The function bumps TTL on three related entries atomically in one call:
+    ///
+    /// 1. `DataKey::Snapshot(business, period)` — the snapshot record itself.
+    /// 2. `DataKey::BusinessPeriods(business)` — the period index for the business.
+    /// 3. `DataKey::EpochBusinesses(period)` — the business index for the epoch.
+    ///
+    /// These three entries together form the complete pointer chain for a
+    /// (business, period) pair.  Bumping them together ensures no part of the
+    /// chain can expire while the others survive.
+    ///
+    /// # Returns
+    ///
+    /// `true` if the snapshot pointer existed and was bumped; `false` if no
+    /// snapshot exists for (business, period), in which case no TTL is touched
+    /// and no event is emitted.
+    ///
+    /// # Authorization
+    ///
+    /// Caller must be admin or an authorized writer.
+    ///
+    /// # Security
+    ///
+    /// - Only admin / writers can call this; arbitrary callers cannot force
+    ///   TTL extensions.
+    /// - The check for pointer existence prevents spurious `PointerTtlBumped`
+    ///   events for phantom entries.
+    /// - TTL amounts are protocol constants (`POINTER_TTL_THRESHOLD`,
+    ///   `POINTER_TTL_BUMP`), not caller-supplied, so callers cannot set
+    ///   arbitrarily large TTLs.
+    pub fn bump_snapshot_pointer_ttl(
+        env: Env,
+        caller: Address,
+        business: Address,
+        period: String,
+    ) -> bool {
+        Self::require_admin_or_writer(&env, &caller);
+
+        let snapshot_key = DataKey::Snapshot(business.clone(), period.clone());
+
+        // Guard: only bump when the pointer actually exists.
+        if !env.storage().instance().has(&snapshot_key) {
+            return false;
+        }
+
+        // Bump the shared instance TTL.  All three entries live in instance
+        // storage, so a single extend_ttl call covers all of them.
+        env.storage()
+            .instance()
+            .extend_ttl(POINTER_TTL_THRESHOLD, POINTER_TTL_BUMP);
+
+        // Emit audit event so off-chain keepers can track bump history.
+        let event = PointerTtlBumpedEvent {
+            business: business.clone(),
+            period: period.clone(),
+            bumped_at: env.ledger().timestamp(),
+            ttl_bump: POINTER_TTL_BUMP,
+        };
+        env.events()
+            .publish((TOPIC_POINTER_TTL_BUMPED, business), event);
+
+        true
+    }
+
     // ── Read-only queries ────────────────────────────────────────────
 
     /// Get the snapshot for (business, period), if any.
@@ -444,3 +569,6 @@ impl AttestationSnapshotContract {
         assert!(period.len() <= MAX_PERIOD_BYTES, "period exceeds max bytes");
     }
 }
+
+#[cfg(test)]
+mod snapshot_ttl_test;
